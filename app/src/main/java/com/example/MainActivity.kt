@@ -73,8 +73,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val TARGET_URL = "https://aistudio.google.com/apps?source=user&tag=created-by-you"
-        // TODO: Replace with your actual GitHub owner and repo name
-        const val GITHUB_REPO = "OWNER/REPO" 
+        const val GITHUB_REPO = "Areo-RGB/ai_fullscreen" 
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
