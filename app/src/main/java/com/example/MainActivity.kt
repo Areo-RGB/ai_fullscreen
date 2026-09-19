@@ -8,7 +8,11 @@ import android.os.Build
 import android.os.Bundle
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.os.Message
 import android.webkit.CookieManager
+import android.webkit.GeolocationPermissions
+import android.webkit.PermissionRequest
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -58,7 +62,13 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import android.Manifest
+import android.os.Environment
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
 import kotlinx.coroutines.Dispatchers
@@ -126,6 +136,82 @@ fun FullscreenWebViewScreen(url: String) {
     var showUpdateDialog by remember { mutableStateOf(false) }
     var updateUrl by remember { mutableStateOf("") }
     var latestVersionName by remember { mutableStateOf("") }
+
+    var filePathCallbackRef by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
+
+    val fileChooserLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val callback = filePathCallbackRef
+        if (callback != null) {
+            val uris = WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+            callback.onReceiveValue(uris)
+            filePathCallbackRef = null
+        }
+    }
+
+    val context = LocalContext.current
+    
+    // Permission state
+    val permissionsToRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+            Manifest.permission.READ_MEDIA_IMAGES,
+            Manifest.permission.READ_MEDIA_VIDEO,
+            Manifest.permission.READ_MEDIA_AUDIO,
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.POST_NOTIFICATIONS,
+            Manifest.permission.NEARBY_WIFI_DEVICES
+        )
+    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
+        )
+    } else {
+        arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE,
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
+        )
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        // Special case for MANAGE_EXTERNAL_STORAGE on Android 11+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                try {
+                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                    intent.data = Uri.parse("package:${context.packageName}")
+                    context.startActivity(intent)
+                } catch (e: Exception) {
+                    val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    context.startActivity(intent)
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        launcher.launch(permissionsToRequest)
+    }
 
     // Check for updates on launch
     LaunchedEffect(Unit) {
@@ -212,8 +298,13 @@ fun FullscreenWebViewScreen(url: String) {
                         settings.apply {
                             javaScriptEnabled = true
                             domStorageEnabled = true
+                            databaseEnabled = true
                             allowFileAccess = true
                             allowContentAccess = true
+                            allowFileAccessFromFileURLs = true
+                            allowUniversalAccessFromFileURLs = true
+                            javaScriptCanOpenWindowsAutomatically = true
+                            setSupportMultipleWindows(true)
                             loadWithOverviewMode = true
                             useWideViewPort = true
                             setSupportZoom(true)
@@ -221,6 +312,8 @@ fun FullscreenWebViewScreen(url: String) {
                             displayZoomControls = false
                             cacheMode = WebSettings.LOAD_DEFAULT
                             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                            setGeolocationEnabled(true)
+                            mediaPlaybackRequiresUserGesture = false
                         }
 
                         // Enable Cookies
@@ -228,12 +321,80 @@ fun FullscreenWebViewScreen(url: String) {
                         cookieManager.setAcceptCookie(true)
                         cookieManager.setAcceptThirdPartyCookies(this, true)
 
-                        webChromeClient = object : WebChromeClient() {
+                        val customWebChromeClient = object : WebChromeClient() {
                             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                                 progress = newProgress / 100f
                                 isLoading = newProgress < 100
                             }
+
+                            override fun onPermissionRequest(request: PermissionRequest?) {
+                                request?.grant(request.resources)
+                            }
+
+                            override fun onGeolocationPermissionsShowPrompt(
+                                origin: String?,
+                                callback: GeolocationPermissions.Callback?
+                            ) {
+                                callback?.invoke(origin, true, false)
+                            }
+
+                            override fun onShowFileChooser(
+                                webView: WebView?,
+                                filePathCallback: ValueCallback<Array<Uri>>?,
+                                fileChooserParams: FileChooserParams?
+                            ): Boolean {
+                                filePathCallbackRef?.onReceiveValue(null)
+                                filePathCallbackRef = filePathCallback
+
+                                val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                                    addCategory(Intent.CATEGORY_OPENABLE)
+                                    type = "*/*"
+                                }
+
+                                if (fileChooserParams?.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                                    intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                                }
+
+                                try {
+                                    fileChooserLauncher.launch(intent)
+                                } catch (e: Exception) {
+                                    filePathCallbackRef?.onReceiveValue(null)
+                                    filePathCallbackRef = null
+                                    return false
+                                }
+                                return true
+                            }
+
+                            override fun onCreateWindow(
+                                view: WebView?,
+                                isDialog: Boolean,
+                                isUserGesture: Boolean,
+                                resultMsg: Message?
+                            ): Boolean {
+                                val newWebView = WebView(view?.context ?: return false).apply {
+                                    settings.javaScriptEnabled = true
+                                    settings.domStorageEnabled = true
+                                    settings.javaScriptCanOpenWindowsAutomatically = true
+                                    settings.allowFileAccess = true
+                                    settings.allowContentAccess = true
+                                    settings.setSupportMultipleWindows(true)
+                                    webViewClient = object : WebViewClient() {
+                                        override fun shouldOverrideUrlLoading(v: WebView?, request: WebResourceRequest?): Boolean {
+                                            val targetUrl = request?.url?.toString() ?: return false
+                                            view?.loadUrl(targetUrl)
+                                            return true
+                                        }
+                                    }
+                                }
+                                newWebView.webChromeClient = this
+                                val transport = resultMsg?.obj as? WebView.WebViewTransport
+                                transport?.webView = newWebView
+                                resultMsg?.sendToTarget()
+                                return true
+                            }
                         }
+
+                        webChromeClient = customWebChromeClient
 
                         webViewClient = object : WebViewClient() {
                             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
