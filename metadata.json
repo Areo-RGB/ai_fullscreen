@@ -1,0 +1,6 @@
+{
+  "name": "AI Studio Apps",
+  "description": "Fullscreen webview for AI Studio Apps",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
