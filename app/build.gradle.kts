@@ -65,6 +65,28 @@ android {
   }
 }
 
+val buildDirFile = layout.buildDirectory.get().asFile
+val rootDirLocation = layout.projectDirectory.asFile.parentFile
+
+val copyVersionedApkTask = tasks.register("copyVersionedApk") {
+  val runNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+  val vName = "1.0.$runNumber"
+  val srcApk = File(buildDirFile, "outputs/apk/debug/app-debug.apk")
+  val targetApk = File(buildDirFile, "outputs/apk/debug/AIStudioApps-v$vName.apk")
+  val rootApk = File(rootDirLocation, "AIStudioApps-v$vName.apk")
+
+  doLast {
+    if (srcApk.exists()) {
+      srcApk.copyTo(targetApk, overwrite = true)
+      srcApk.copyTo(rootApk, overwrite = true)
+    }
+  }
+}
+
+afterEvaluate {
+  tasks.findByName("assembleDebug")?.finalizedBy(copyVersionedApkTask)
+}
+
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
 // to match the convention used in Web projects.
 secrets {

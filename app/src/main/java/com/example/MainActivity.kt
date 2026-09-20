@@ -68,6 +68,16 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.core.content.FileProvider
+import kotlinx.coroutines.launch
+import java.io.File
+import java.io.FileOutputStream
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.TextButton
@@ -132,10 +142,21 @@ fun FullscreenWebViewScreen(url: String) {
     var canGoBack by remember { mutableStateOf(false) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
 
-    // Update Check State
+    // Update Check & Install State
+    val coroutineScope = rememberCoroutineScope()
     var showUpdateDialog by remember { mutableStateOf(false) }
+    var isDownloadingUpdate by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableFloatStateOf(0f) }
+    var updateStatusMessage by remember { mutableStateOf("") }
     var updateUrl by remember { mutableStateOf("") }
     var latestVersionName by remember { mutableStateOf("") }
+
+    // Small camera safety zone (display cutout / punch hole)
+    val cutoutPadding = WindowInsets.displayCutout.asPaddingValues()
+    val statusBarPadding = WindowInsets.statusBars.asPaddingValues()
+    val cameraSafetyZone = remember(cutoutPadding, statusBarPadding) {
+        maxOf(cutoutPadding.calculateTopPadding(), statusBarPadding.calculateTopPadding(), 28.dp)
+    }
 
     var filePathCallbackRef by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
 
@@ -213,25 +234,31 @@ fun FullscreenWebViewScreen(url: String) {
         launcher.launch(permissionsToRequest)
     }
 
-    // Check for updates on launch
+    // Check for updates on startup
     LaunchedEffect(Unit) {
-        if (MainActivity.GITHUB_REPO != "OWNER/REPO") {
+        if (MainActivity.GITHUB_REPO.isNotBlank() && MainActivity.GITHUB_REPO != "OWNER/REPO") {
             try {
                 val latest = getLatestRelease(MainActivity.GITHUB_REPO)
                 if (latest != null) {
-                    val latestTag = latest.getString("tag_name").removePrefix("v")
-                    val currentVersion = BuildConfig.VERSION_NAME
+                    val latestTag = latest.optString("tag_name", "").removePrefix("v").removePrefix("V").trim()
+                    val currentVersion = BuildConfig.VERSION_NAME.removePrefix("v").removePrefix("V").trim()
                     
-                    if (latestTag != currentVersion) {
+                    if (isNewerVersion(latestTag, currentVersion)) {
                         latestVersionName = latestTag
                         // Find APK asset URL
-                        val assets = latest.getJSONArray("assets")
-                        for (i in 0 until assets.length()) {
-                            val asset = assets.getJSONObject(i)
-                            if (asset.getString("name").endsWith(".apk")) {
-                                updateUrl = asset.getString("browser_download_url")
-                                showUpdateDialog = true
-                                break
+                        val assets = latest.optJSONArray("assets")
+                        if (assets != null) {
+                            for (i in 0 until assets.length()) {
+                                val asset = assets.getJSONObject(i)
+                                val name = asset.optString("name", "")
+                                if (name.endsWith(".apk", ignoreCase = true)) {
+                                    val downloadUrl = asset.optString("browser_download_url", "")
+                                    if (downloadUrl.isNotBlank()) {
+                                        updateUrl = downloadUrl
+                                        showUpdateDialog = true
+                                        break
+                                    }
+                                }
                             }
                         }
                     }
@@ -253,21 +280,87 @@ fun FullscreenWebViewScreen(url: String) {
 
     if (showUpdateDialog) {
         AlertDialog(
-            onDismissRequest = { showUpdateDialog = false },
-            title = { Text("Update Available") },
-            text = { Text("A new version (v$latestVersionName) is available. Would you like to download it?") },
-            confirmButton = {
-                TextButton(onClick = {
-                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(updateUrl))
-                    webViewRef?.context?.startActivity(intent)
+            onDismissRequest = {
+                if (!isDownloadingUpdate) {
                     showUpdateDialog = false
-                }) {
-                    Text("Download")
+                }
+            },
+            title = {
+                Text(
+                    text = if (isDownloadingUpdate) "Downloading Update" else "Update Available",
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                if (isDownloadingUpdate) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = if (updateStatusMessage.isNotEmpty()) updateStatusMessage else "Downloading v$latestVersionName...",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        if (downloadProgress > 0f) {
+                            LinearProgressIndicator(
+                                progress = { downloadProgress },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "${(downloadProgress * 100).toInt()}%",
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.align(Alignment.End)
+                            )
+                        } else {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+                    }
+                } else {
+                    Text(
+                        text = "A new version (v$latestVersionName) is available. Would you like to install it now?",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            },
+            confirmButton = {
+                if (!isDownloadingUpdate) {
+                    Button(onClick = {
+                        isDownloadingUpdate = true
+                        updateStatusMessage = "Starting download..."
+                        coroutineScope.launch {
+                            val downloadsDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                                ?: context.cacheDir
+                            val apkFile = File(downloadsDir, "AIStudioApps-update.apk")
+                            val success = downloadApk(updateUrl, apkFile) { progress ->
+                                downloadProgress = progress
+                                updateStatusMessage = "Downloading: ${(progress * 100).toInt()}%"
+                            }
+                            if (success && apkFile.exists()) {
+                                updateStatusMessage = "Prompting installation..."
+                                promptInstallApk(context, apkFile)
+                                showUpdateDialog = false
+                                isDownloadingUpdate = false
+                            } else {
+                                // Fallback directly to browser download
+                                try {
+                                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(updateUrl))
+                                    context.startActivity(intent)
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+                                showUpdateDialog = false
+                                isDownloadingUpdate = false
+                            }
+                        }
+                    }) {
+                        Text("Install Now")
+                    }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showUpdateDialog = false }) {
-                    Text("Later")
+                if (!isDownloadingUpdate) {
+                    TextButton(onClick = { showUpdateDialog = false }) {
+                        Text("Later")
+                    }
                 }
             }
         )
@@ -277,11 +370,24 @@ fun FullscreenWebViewScreen(url: String) {
         modifier = Modifier.fillMaxSize(),
         contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { innerPadding ->
-        Box(
+        Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
+            // Small safety zone for camera notch / punch hole
+            Spacer(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(cameraSafetyZone)
+                    .background(MaterialTheme.colorScheme.background)
+            )
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
             // Main WebView
             AndroidView(
                 modifier = Modifier
@@ -455,7 +561,7 @@ fun FullscreenWebViewScreen(url: String) {
             )
 
             // Top progress indicator
-            AnimatedVisibility(
+            androidx.compose.animation.AnimatedVisibility(
                 visible = isLoading && !hasError,
                 enter = fadeIn(),
                 exit = fadeOut(),
@@ -527,16 +633,37 @@ fun FullscreenWebViewScreen(url: String) {
                     }
                 }
             }
+            }
         }
     }
+}
+
+fun isNewerVersion(latest: String, current: String): Boolean {
+    val cleanLatest = latest.trim().removePrefix("v").removePrefix("V")
+    val cleanCurrent = current.trim().removePrefix("v").removePrefix("V")
+    if (cleanLatest.isEmpty() || cleanLatest == cleanCurrent) return false
+
+    val latestParts = cleanLatest.split(".").mapNotNull { it.toIntOrNull() }
+    val currentParts = cleanCurrent.split(".").mapNotNull { it.toIntOrNull() }
+
+    val maxLen = maxOf(latestParts.size, currentParts.size)
+    for (i in 0 until maxLen) {
+        val l = latestParts.getOrElse(i) { 0 }
+        val c = currentParts.getOrElse(i) { 0 }
+        if (l > c) return true
+        if (l < c) return false
+    }
+    return cleanLatest != cleanCurrent
 }
 
 suspend fun getLatestRelease(repo: String): JSONObject? = withContext(Dispatchers.IO) {
     val client = OkHttpClient()
     val request = Request.Builder()
         .url("https://api.github.com/repos/$repo/releases/latest")
+        .header("User-Agent", "AIStudioApp-UpdateChecker")
+        .header("Accept", "application/vnd.github.v3+json")
         .build()
-    
+
     try {
         client.newCall(request).execute().use { response ->
             if (response.isSuccessful) {
@@ -547,3 +674,79 @@ suspend fun getLatestRelease(repo: String): JSONObject? = withContext(Dispatcher
         null
     }
 }
+
+suspend fun downloadApk(
+    downloadUrl: String,
+    destinationFile: File,
+    onProgress: (Float) -> Unit
+): Boolean = withContext(Dispatchers.IO) {
+    val client = OkHttpClient()
+    val request = Request.Builder()
+        .url(downloadUrl)
+        .header("User-Agent", "AIStudioApp-UpdateChecker")
+        .build()
+
+    try {
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@withContext false
+            val body = response.body ?: return@withContext false
+            val contentLength = body.contentLength()
+
+            if (destinationFile.exists()) {
+                destinationFile.delete()
+            }
+
+            body.byteStream().use { input ->
+                FileOutputStream(destinationFile).use { output ->
+                    val buffer = ByteArray(8 * 1024)
+                    var bytesRead: Int
+                    var totalRead = 0L
+
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        totalRead += bytesRead
+                        if (contentLength > 0) {
+                            val progress = (totalRead.toFloat() / contentLength.toFloat()).coerceIn(0f, 1f)
+                            withContext(Dispatchers.Main) {
+                                onProgress(progress)
+                            }
+                        }
+                    }
+                    output.flush()
+                }
+            }
+            true
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        false
+    }
+}
+
+fun promptInstallApk(context: android.content.Context, apkFile: File) {
+    try {
+        val apkUri = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            apkFile
+        )
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(apkUri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        e.printStackTrace()
+        try {
+            val fallbackIntent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+                data = Uri.fromFile(apkFile)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(fallbackIntent)
+        } catch (e2: Exception) {
+            e2.printStackTrace()
+        }
+    }
+}
+
